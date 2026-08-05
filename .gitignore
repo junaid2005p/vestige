@@ -1,0 +1,6 @@
+# Local Go build artifacts
+*.exe
+
+# Go coverage/profile output
+coverage.out
+*.prof
