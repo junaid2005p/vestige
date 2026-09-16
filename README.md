@@ -31,17 +31,17 @@ Do not create the repository inside the directory being backed up; Vestige rejec
 vestige init [--compression none|gzip|zstd] <repo-dir>
 vestige backup [--workers N] [--message TEXT] [--tags one,two] [--labels key=value] [--include glob] [--exclude glob] <source-dir> <repo-dir>
 vestige snapshots <repo-dir>
-vestige show <repo-dir> <snapshot-id>
-vestige diff <repo-dir> <older-snapshot-id> <newer-snapshot-id>
-vestige find <repo-dir> <snapshot-id> <glob>
-vestige restore [--include glob] [--overwrite] [--clean-destination] <repo-dir> <snapshot-id> <destination-dir>
-vestige restore --stdout <repo-dir> <snapshot-id> <source-relative-file>
-vestige verify <repo-dir> [snapshot-id]
-vestige delete [--dry-run|--yes] <repo-dir> <snapshot-id>
+vestige show <repo-dir> <snapshot-id|latest>
+vestige diff <repo-dir> <older-snapshot-id|latest> <newer-snapshot-id|latest>
+vestige find <repo-dir> <snapshot-id|latest> <glob>
+vestige restore [--include glob] [--overwrite] [--clean-destination] <repo-dir> <snapshot-id|latest> <destination-dir>
+vestige restore --stdout <repo-dir> <snapshot-id|latest> <source-relative-file>
+vestige verify <repo-dir> [snapshot-id|latest]
+vestige delete [--dry-run|--yes] <repo-dir> <snapshot-id|latest>
 vestige gc [--dry-run] <repo-dir>
 ```
 
-`restore` refuses an existing destination by default. Use `--overwrite` to replace only restored paths; `--clean-destination` additionally clears the destination and requires `--overwrite`. Restore validates every chunk before writing it.
+`latest` may be used anywhere a snapshot ID is accepted; it resolves to the newest published snapshot. `restore` refuses an existing destination by default. Use `--overwrite` to replace only restored paths; `--clean-destination` additionally clears the destination and requires `--overwrite`. Restore validates every chunk before writing it.
 
 `backup` accepts comma-separated, source-relative `path.Match` patterns for `--include` and `--exclude`; exclusions win. It can also record a message, tags, and immutable `key=value` labels with each snapshot.
 

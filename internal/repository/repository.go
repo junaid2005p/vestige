@@ -523,6 +523,9 @@ func (r *Repository) publishManifest(m model.Manifest) error {
 
 func (r *Repository) ReadManifest(id string) (model.Manifest, error) {
 	var m model.Manifest
+	if id == "latest" {
+		return r.LatestSnapshot()
+	}
 	if strings.ContainsAny(id, `\\/`) || id == "" {
 		return m, fmt.Errorf("invalid snapshot ID")
 	}
@@ -560,6 +563,20 @@ func (r *Repository) Snapshots() ([]model.Manifest, error) {
 	}
 	sort.Slice(snapshots, func(i, j int) bool { return snapshots[i].SnapshotID < snapshots[j].SnapshotID })
 	return snapshots, nil
+}
+
+// LatestSnapshot returns the most recently published snapshot. Snapshot IDs
+// are UTC timestamps, so their lexical ordering is chronological.
+func (r *Repository) LatestSnapshot() (model.Manifest, error) {
+	var m model.Manifest
+	snapshots, err := r.Snapshots()
+	if err != nil {
+		return m, err
+	}
+	if len(snapshots) == 0 {
+		return m, errors.New("repository contains no snapshots")
+	}
+	return snapshots[len(snapshots)-1], nil
 }
 
 // FilesReferencingChunk returns the regular files in one snapshot that refer

@@ -55,18 +55,18 @@ func usage() {
 Usage:
   vestige init [--compression none|gzip|zstd] <repo-dir>
   vestige backup [--workers N] [--compression none|gzip|zstd] [--message TEXT] [--tags one,two] [--labels key=value] [--include glob] [--exclude glob] [--stale-lock-after DURATION] <source-dir> <repo-dir>
-  vestige restore [--include glob] [--overwrite] [--clean-destination] <repo-dir> <snapshot-id> <destination-dir>
-  vestige restore --stdout <repo-dir> <snapshot-id> <source-relative-file>
+  vestige restore [--include glob] [--overwrite] [--clean-destination] <repo-dir> <snapshot-id|latest> <destination-dir>
+  vestige restore --stdout <repo-dir> <snapshot-id|latest> <source-relative-file>
   vestige snapshots <repo-dir>
-  vestige show <repo-dir> <snapshot-id>
-  vestige find <repo-dir> <snapshot-id> <glob>
-  vestige find --chunk <sha256> <repo-dir> <snapshot-id>
-  vestige diff <repo-dir> <older-snapshot-id> <newer-snapshot-id>
+  vestige show <repo-dir> <snapshot-id|latest>
+  vestige find <repo-dir> <snapshot-id|latest> <glob>
+  vestige find --chunk <sha256> <repo-dir> <snapshot-id|latest>
+  vestige diff <repo-dir> <older-snapshot-id|latest> <newer-snapshot-id|latest>
   vestige stats <repo-dir>
-  vestige verify <repo-dir> [snapshot-id]
+  vestige verify <repo-dir> [snapshot-id|latest]
   vestige gc [--dry-run] [--stale-lock-after DURATION] <repo-dir>
   vestige recover --stale-lock-after DURATION <repo-dir>
-  vestige delete [--dry-run|--yes] [--stale-lock-after DURATION] <repo-dir> <snapshot-id>
+  vestige delete [--dry-run|--yes] [--stale-lock-after DURATION] <repo-dir> <snapshot-id|latest>
   vestige bench --workdir <parent-dir> [--dataset-mib 128] [--trials 3] [--compression none|gzip|zstd] [--profile-dir profiles] [--output results.json]
 `)
 }

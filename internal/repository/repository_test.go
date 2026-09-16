@@ -79,6 +79,82 @@ func TestBackupRestoreDeduplicatesAndVerifies(t *testing.T) {
 	}
 }
 
+func TestLatestSnapshotSelector(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("first"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Open(filepath.Join(root, "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := r.Backup(source, smallConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(time.Millisecond)
+	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("second"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := r.Backup(source, smallConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.SnapshotID == second.SnapshotID {
+		t.Fatal("snapshot IDs must differ")
+	}
+	latest, err := r.ReadManifest("latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest.SnapshotID != second.SnapshotID {
+		t.Fatalf("latest = %s, want %s", latest.SnapshotID, second.SnapshotID)
+	}
+}
+
+func TestLatestSnapshotRejectsEmptyRepository(t *testing.T) {
+	r, err := Open(filepath.Join(t.TempDir(), "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ReadManifest("latest"); err == nil {
+		t.Fatal("latest selector succeeded for empty repository")
+	}
+}
+
+func TestDeleteLatestSnapshotSelector(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "a.txt"), []byte("data"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Open(filepath.Join(root, "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _, err := r.Backup(source, smallConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err := r.DeleteSnapshot("latest", false, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.SnapshotID != snapshot.SnapshotID {
+		t.Fatalf("deleted %s, want %s", stats.SnapshotID, snapshot.SnapshotID)
+	}
+	if _, err := r.ReadManifest(snapshot.SnapshotID); err == nil {
+		t.Fatal("deleted latest snapshot is still readable")
+	}
+}
+
 func TestVerifyDetectsCorruptedChunk(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
