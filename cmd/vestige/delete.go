@@ -18,9 +18,13 @@ func runDelete(args []string) error {
 		return fmt.Errorf("usage: vestige delete [--dry-run|--yes] [--stale-lock-after DURATION] <repo-dir> <snapshot-id>")
 	}
 	r, err := repository.Open(flags.Args()[0])
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	stats, err := r.DeleteSnapshot(flags.Args()[1], !*yes, *staleLockAfter)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	if stats.DryRun {
 		fmt.Printf("preview: snapshot %s\nfiles: %d\nlogical bytes: %d\nreferenced chunks: %d\nrun again with --yes to delete the manifest; then run gc --dry-run to see reclaimable chunks\n", stats.SnapshotID, stats.Files, stats.LogicalBytes, stats.ReferencedChunks)
 		return nil

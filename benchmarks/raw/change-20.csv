@@ -1,0 +1,4 @@
+trial,dataset_bytes,initial_backup_mib_per_second,incremental_backup_mib_per_second,incremental_chunk_reuse_percent,verify_seconds,restore_mib_per_second,repository_bytes,space_saved_percent,go_allocated_bytes
+1,1073741824,86.361,106.083,81.255,5.312,159.689,1074790400,49.951,69340510192
+2,1073741824,82.783,104.908,81.081,5.015,168.618,1074790400,49.951,69132039968
+3,1073741824,93.507,103.763,81.236,5.842,128.657,1074790400,49.951,69300061224

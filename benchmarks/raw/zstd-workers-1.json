@@ -1,0 +1,107 @@
+{
+  "format": "vestige-benchmark/v1",
+  "created_at": "2026-09-16T06:19:38.6934764Z",
+  "command": "vestige bench --workdir benchmarks\\work --dataset-mib 1024 --trials 3 --workers 1 --compression zstd --change-percent 10 --max-disk-mib 4096 --output benchmarks\\raw\\zstd-workers-1.json",
+  "go_version": "go1.25.3",
+  "os": "windows",
+  "architecture": "amd64",
+  "logical_cpus": 16,
+  "dataset_mib": 1024,
+  "trials": 3,
+  "workers": 1,
+  "compression": "zstd",
+  "change_percent": 10,
+  "disk_budget_mib": 4096,
+  "estimated_peak_mib": 3136,
+  "runs": [
+    {
+      "trial": 1,
+      "dataset_bytes": 1073741824,
+      "initial_backup_seconds": 12.57346,
+      "initial_backup_mib_per_second": 81.44138526706253,
+      "initial_created_chunks": 958,
+      "initial_written_bytes": 643863579,
+      "incremental_backup_seconds": 8.7727877,
+      "incremental_backup_mib_per_second": 116.72458459242094,
+      "incremental_chunk_reuse_percent": 91.3626209977662,
+      "incremental_written_bytes": 108003908,
+      "verify_seconds": 3.2884431,
+      "restore_seconds": 5.2159564,
+      "restore_mib_per_second": 196.320659428825,
+      "repository_bytes": 751867487,
+      "logical_snapshot_bytes": 2147483648,
+      "space_saved_percent": 64.98844181187451,
+      "go_allocated_bytes": 68277146648
+    },
+    {
+      "trial": 2,
+      "dataset_bytes": 1073741824,
+      "initial_backup_seconds": 12.517621,
+      "initial_backup_mib_per_second": 81.80468157647528,
+      "initial_created_chunks": 939,
+      "initial_written_bytes": 643863484,
+      "incremental_backup_seconds": 8.5168121,
+      "incremental_backup_mib_per_second": 120.23278052594351,
+      "incremental_chunk_reuse_percent": 91.2781954887218,
+      "incremental_written_bytes": 108003908,
+      "verify_seconds": 3.2637668,
+      "restore_seconds": 5.0392338,
+      "restore_mib_per_second": 203.20549524810696,
+      "repository_bytes": 751867392,
+      "logical_snapshot_bytes": 2147483648,
+      "space_saved_percent": 64.98844623565674,
+      "go_allocated_bytes": 68059685296
+    },
+    {
+      "trial": 3,
+      "dataset_bytes": 1073741824,
+      "initial_backup_seconds": 12.7095252,
+      "initial_backup_mib_per_second": 80.56949287137807,
+      "initial_created_chunks": 951,
+      "initial_written_bytes": 643863544,
+      "incremental_backup_seconds": 8.7163196,
+      "incremental_backup_mib_per_second": 117.4807770931208,
+      "incremental_chunk_reuse_percent": 91.28166915052161,
+      "incremental_written_bytes": 108003913,
+      "verify_seconds": 3.2063309,
+      "restore_seconds": 4.9359646999999995,
+      "restore_mib_per_second": 207.45691313392092,
+      "repository_bytes": 751867457,
+      "logical_snapshot_bytes": 2147483648,
+      "space_saved_percent": 64.98844320885837,
+      "go_allocated_bytes": 68211615104
+    }
+  ],
+  "summary": {
+    "initial_backup_mib_per_second": {
+      "min": 80.56949287137807,
+      "median": 81.44138526706253,
+      "max": 81.80468157647528
+    },
+    "incremental_backup_mib_per_second": {
+      "min": 116.72458459242094,
+      "median": 117.4807770931208,
+      "max": 120.23278052594351
+    },
+    "incremental_chunk_reuse_percent": {
+      "min": 91.2781954887218,
+      "median": 91.28166915052161,
+      "max": 91.3626209977662
+    },
+    "verify_seconds": {
+      "min": 3.2063309,
+      "median": 3.2637668,
+      "max": 3.2884431
+    },
+    "restore_mib_per_second": {
+      "min": 196.320659428825,
+      "median": 203.20549524810696,
+      "max": 207.45691313392092
+    },
+    "space_saved_percent": {
+      "min": 64.98844181187451,
+      "median": 64.98844320885837,
+      "max": 64.98844623565674
+    }
+  }
+}

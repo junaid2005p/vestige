@@ -1,0 +1,71 @@
+{
+  "format": "vestige-benchmark/v1",
+  "created_at": "2026-09-16T06:18:53.360902Z",
+  "command": "vestige bench --workdir benchmarks\\profile-work --dataset-mib 256 --trials 1 --workers 1 --max-disk-mib 1024 --profile-dir benchmarks\\profiles --output benchmarks\\raw\\profile-workers-1.json",
+  "go_version": "go1.25.3",
+  "os": "windows",
+  "architecture": "amd64",
+  "logical_cpus": 16,
+  "dataset_mib": 256,
+  "trials": 1,
+  "workers": 1,
+  "compression": "none",
+  "change_percent": 10,
+  "disk_budget_mib": 1024,
+  "estimated_peak_mib": 832,
+  "runs": [
+    {
+      "trial": 1,
+      "dataset_bytes": 268435456,
+      "initial_backup_seconds": 2.9494275,
+      "initial_backup_mib_per_second": 86.79650542351015,
+      "initial_created_chunks": 242,
+      "initial_written_bytes": 216006656,
+      "incremental_backup_seconds": 2.3512658,
+      "incremental_backup_mib_per_second": 108.87752460823441,
+      "incremental_chunk_reuse_percent": 91.61676646706587,
+      "incremental_written_bytes": 27262976,
+      "verify_seconds": 2.0729633,
+      "restore_seconds": 2.2556916,
+      "restore_mib_per_second": 113.49069172399277,
+      "repository_bytes": 243269632,
+      "logical_snapshot_bytes": 536870912,
+      "space_saved_percent": 54.6875,
+      "go_allocated_bytes": 17422131392,
+      "cpu_profile": "benchmarks\\profiles\\trial-01-initial-backup.cpu.pprof",
+      "heap_profile": "benchmarks\\profiles\\trial-01-after-restore.heap.pprof"
+    }
+  ],
+  "summary": {
+    "initial_backup_mib_per_second": {
+      "min": 86.79650542351015,
+      "median": 86.79650542351015,
+      "max": 86.79650542351015
+    },
+    "incremental_backup_mib_per_second": {
+      "min": 108.87752460823441,
+      "median": 108.87752460823441,
+      "max": 108.87752460823441
+    },
+    "incremental_chunk_reuse_percent": {
+      "min": 91.61676646706587,
+      "median": 91.61676646706587,
+      "max": 91.61676646706587
+    },
+    "verify_seconds": {
+      "min": 2.0729633,
+      "median": 2.0729633,
+      "max": 2.0729633
+    },
+    "restore_mib_per_second": {
+      "min": 113.49069172399277,
+      "median": 113.49069172399277,
+      "max": 113.49069172399277
+    },
+    "space_saved_percent": {
+      "min": 54.6875,
+      "median": 54.6875,
+      "max": 54.6875
+    }
+  }
+}
