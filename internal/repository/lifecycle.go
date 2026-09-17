@@ -2,8 +2,6 @@ package repository
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"time"
 )
 
@@ -19,8 +17,8 @@ type DeleteStats struct {
 }
 
 // DeleteSnapshot removes one published manifest only after a caller opts out
-// of dry-run. Moving the manifest directory out of snapshots is the atomic
-// publication point: it is no longer visible to readers before cleanup starts.
+// of dry-run. A manifest is the publication point in both local and S3
+// repositories, so deleting it immediately unpublishes the snapshot.
 func (r *Repository) DeleteSnapshot(id string, dryRun bool, staleAfter time.Duration) (DeleteStats, error) {
 	stats := DeleteStats{SnapshotID: id, DryRun: dryRun}
 	lock, err := r.acquireWriteLock(staleAfter)
@@ -53,13 +51,8 @@ func (r *Repository) DeleteSnapshot(id string, dryRun bool, staleAfter time.Dura
 	if dryRun {
 		return stats, nil
 	}
-	source := filepath.Join(r.snapshotsDir(), manifest.SnapshotID)
-	trash := filepath.Join(r.tmpDir(), fmt.Sprintf("deleted-snapshot-%s-%d", manifest.SnapshotID, time.Now().UnixNano()))
-	if err := os.Rename(source, trash); err != nil {
+	if err := r.store.Delete(r.manifestKey(manifest.SnapshotID)); err != nil {
 		return stats, fmt.Errorf("unpublish snapshot %s: %w", manifest.SnapshotID, err)
-	}
-	if err := os.RemoveAll(trash); err != nil {
-		return stats, fmt.Errorf("remove unpublished snapshot %s: %w", manifest.SnapshotID, err)
 	}
 	return stats, nil
 }

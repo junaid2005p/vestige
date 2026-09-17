@@ -14,7 +14,11 @@ type writeLockInfo struct {
 	CreatedAt string `json:"created_at"`
 }
 
-type writeLock struct{ path string }
+type writeLock struct {
+	store   objectStore
+	key     string
+	version string
+}
 
 func (r *Repository) lockPath() string { return filepath.Join(r.Root, "write.lock") }
 
@@ -22,47 +26,43 @@ func (r *Repository) lockPath() string { return filepath.Join(r.Root, "write.loc
 // only when the caller explicitly provides a positive lease duration; this
 // avoids guessing whether a long-running backup is still alive.
 func (r *Repository) acquireWriteLock(staleAfter time.Duration) (*writeLock, error) {
-	path := r.lockPath()
 	info := writeLockInfo{PID: os.Getpid(), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	b, err := json.Marshal(info)
 	if err != nil {
 		return nil, err
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		version, err := r.store.PutIfAbsent("write.lock", append(b, '\n'))
 		if err == nil {
-			if _, writeErr := f.Write(append(b, '\n')); writeErr != nil {
-				f.Close()
-				os.Remove(path)
-				return nil, writeErr
-			}
-			if closeErr := f.Close(); closeErr != nil {
-				os.Remove(path)
-				return nil, closeErr
-			}
-			return &writeLock{path: path}, nil
+			return &writeLock{store: r.store, key: "write.lock", version: version}, nil
 		}
-		if !errors.Is(err, os.ErrExist) {
+		if !errors.Is(err, errObjectExists) {
 			return nil, err
 		}
 		if staleAfter <= 0 {
-			return nil, fmt.Errorf("repository is locked by another writer (%s); retry later or use --stale-lock-after only after confirming the writer crashed", path)
+			return nil, fmt.Errorf("repository is locked by another writer (%s); retry later or use --stale-lock-after only after confirming the writer crashed", r.Root)
 		}
-		stale, staleErr := lockIsStale(path, staleAfter)
+		lockData, lockVersion, getErr := r.store.Get("write.lock")
+		if getErr != nil {
+			if errors.Is(getErr, errObjectNotFound) {
+				continue
+			}
+			return nil, getErr
+		}
+		stale, staleErr := lockDataIsStale(lockData, staleAfter)
 		if staleErr != nil {
 			return nil, staleErr
 		}
 		if !stale {
 			return nil, fmt.Errorf("repository lock is newer than --stale-lock-after (%s)", staleAfter)
 		}
-		// Rename is recoverable evidence of the previous lease. The next loop
-		// creates a fresh lock atomically rather than deleting a path blindly.
-		quarantined := filepath.Join(r.tmpDir(), fmt.Sprintf("stale-lock-%d", time.Now().UnixNano()))
-		if err := os.Rename(path, quarantined); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
+		// S3 uses an ETag precondition here, so a stale-lock recovery cannot
+		// delete a lock that another writer acquired after our read.
+		if err := r.store.DeleteIfVersion("write.lock", lockVersion); err != nil {
+			if errors.Is(err, errObjectChanged) || errors.Is(err, errObjectNotFound) {
 				continue
 			}
-			return nil, fmt.Errorf("quarantine stale repository lock: %w", err)
+			return nil, fmt.Errorf("remove stale repository lock: %w", err)
 		}
 	}
 	return nil, errors.New("repository lock changed while attempting recovery; retry")
@@ -73,6 +73,10 @@ func lockIsStale(path string, maxAge time.Duration) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	return lockDataIsStale(b, maxAge)
+}
+
+func lockDataIsStale(b []byte, maxAge time.Duration) (bool, error) {
 	var info writeLockInfo
 	if err := json.Unmarshal(b, &info); err != nil {
 		return false, fmt.Errorf("invalid repository lock; remove it manually only after confirming no writer is active: %w", err)
@@ -88,7 +92,7 @@ func (l *writeLock) release() error {
 	if l == nil {
 		return nil
 	}
-	if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := l.store.DeleteIfVersion(l.key, l.version); err != nil && !errors.Is(err, errObjectNotFound) && !errors.Is(err, errObjectChanged) {
 		return err
 	}
 	return nil
@@ -106,6 +110,11 @@ func (r *Repository) Recover(staleAfter time.Duration) (int, error) {
 }
 
 func (r *Repository) recoverStaging() (int, error) {
+	if r.remote {
+		// Remote repositories publish a manifest object directly; incomplete work
+		// has no visible staging prefix to recover.
+		return 0, nil
+	}
 	entries, err := os.ReadDir(r.tmpDir())
 	if err != nil {
 		return 0, err
