@@ -4,8 +4,19 @@ const FormatVersion = 1
 
 // RepositoryConfig describes the on-disk repository format.
 type RepositoryConfig struct {
-	FormatVersion int    `json:"format_version"`
-	Compression   string `json:"compression"`
+	FormatVersion int               `json:"format_version"`
+	Compression   string            `json:"compression"`
+	Encryption    *EncryptionConfig `json:"encryption,omitempty"`
+}
+
+// EncryptionConfig contains the non-secret parameters needed to derive a
+// repository key. The passphrase itself is never persisted.
+type EncryptionConfig struct {
+	Algorithm  string `json:"algorithm"`
+	KDF        string `json:"kdf"`
+	Iterations int    `json:"iterations"`
+	Salt       string `json:"salt"`
+	KeyCheck   string `json:"key_check"`
 }
 
 // ChunkingConfig records the parameters necessary to interpret a snapshot.
@@ -23,7 +34,9 @@ type ChunkRef struct {
 	Size int64  `json:"size"`
 }
 
-// FileEntry represents a regular file, empty file, or directory in a snapshot.
+// FileEntry represents a regular file, directory, symbolic link, or hard link
+// in a snapshot. LinkTarget is source-relative for hard links and is the exact
+// link text returned by the operating system for symbolic links.
 // Paths are slash-separated and relative to the backed-up source directory.
 type FileEntry struct {
 	Path       string     `json:"path"`
@@ -32,6 +45,7 @@ type FileEntry struct {
 	Mode       uint32     `json:"mode"`
 	ModifiedNS int64      `json:"modified_ns"`
 	Chunks     []ChunkRef `json:"chunks,omitempty"`
+	LinkTarget string     `json:"link_target,omitempty"`
 }
 
 // Manifest is the immutable commit record for a completed snapshot.

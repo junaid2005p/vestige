@@ -4,7 +4,13 @@ package repository
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hmac"
+	"crypto/pbkdf2"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -13,6 +19,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -27,13 +34,23 @@ import (
 type Repository struct {
 	Root        string
 	config      model.RepositoryConfig
+	key         []byte
 	zstdEncoder *zstd.Encoder
 	zstdDecoder *zstd.Decoder
+	// Test-only failure points exercise the atomic publication boundaries.
+	beforeChunkPublish    func() error
+	beforeSnapshotPublish func() error
 }
 
 // RepositoryOptions selects an immutable repository storage policy when a
 // repository is created. An empty Compression accepts an existing policy.
-type RepositoryOptions struct{ Compression string }
+type RepositoryOptions struct {
+	Compression string
+	// Encrypt creates an encrypted repository. It is immutable once created.
+	Encrypt bool
+	// Passphrase is used only to derive the repository key and is never stored.
+	Passphrase string
+}
 
 // Init creates a repository using the requested immutable storage policy.
 // Calling it again validates and opens the existing repository.
@@ -45,7 +62,11 @@ func Init(root string, options RepositoryOptions) (*Repository, error) {
 type BackupOptions struct {
 	// Workers is the number of concurrent chunk-store operations. It must be at
 	// least one; use one for the deterministic baseline.
-	Workers     int
+	Workers int
+	// FileWorkers bounds concurrent file readers. Zero keeps the historical
+	// one-file-at-a-time behavior; callers that back up many small files should
+	// set it independently of chunk-store workers.
+	FileWorkers int
 	Description string
 	Tags        []string
 	Labels      map[string]string
@@ -68,7 +89,7 @@ type RestoreOptions struct {
 }
 
 func Open(root string) (*Repository, error) {
-	return OpenWithOptions(root, RepositoryOptions{})
+	return OpenWithOptions(root, RepositoryOptions{Passphrase: os.Getenv("VESTIGE_PASSPHRASE")})
 }
 
 func OpenWithOptions(root string, options RepositoryOptions) (*Repository, error) {
@@ -83,7 +104,7 @@ func OpenWithOptions(root string, options RepositoryOptions) (*Repository, error
 	if err := os.MkdirAll(r.Root, 0755); err != nil {
 		return nil, err
 	}
-	if err := r.ensureConfig(options.Compression); err != nil {
+	if err := r.ensureConfig(options); err != nil {
 		return nil, err
 	}
 	if err := r.setupCodec(); err != nil {
@@ -102,14 +123,22 @@ func (r *Repository) chunksDir() string    { return filepath.Join(r.Root, "chunk
 func (r *Repository) snapshotsDir() string { return filepath.Join(r.Root, "snapshots") }
 func (r *Repository) tmpDir() string       { return filepath.Join(r.Root, "tmp") }
 
-func (r *Repository) ensureConfig(requestedCompression string) error {
+func (r *Repository) ensureConfig(options RepositoryOptions) error {
 	path := r.configPath()
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		if requestedCompression == "" {
-			requestedCompression = "none"
+		if options.Compression == "" {
+			options.Compression = "none"
 		}
-		r.config = model.RepositoryConfig{FormatVersion: model.FormatVersion, Compression: requestedCompression}
+		r.config = model.RepositoryConfig{FormatVersion: model.FormatVersion, Compression: options.Compression}
+		if options.Encrypt {
+			if options.Passphrase == "" {
+				return errors.New("encrypted repository requires VESTIGE_PASSPHRASE")
+			}
+			if err := r.configureEncryption(options.Passphrase); err != nil {
+				return err
+			}
+		}
 		return writeJSONAtomic(path, r.config)
 	}
 	if err != nil {
@@ -128,10 +157,16 @@ func (r *Repository) ensureConfig(requestedCompression string) error {
 	if config.Compression != "none" && config.Compression != "gzip" && config.Compression != "zstd" {
 		return fmt.Errorf("unsupported repository compression %q", config.Compression)
 	}
-	if requestedCompression != "" && requestedCompression != config.Compression {
-		return fmt.Errorf("repository uses %s compression; requested %s", config.Compression, requestedCompression)
+	if options.Compression != "" && options.Compression != config.Compression {
+		return fmt.Errorf("repository uses %s compression; requested %s", config.Compression, options.Compression)
+	}
+	if options.Encrypt && config.Encryption == nil {
+		return errors.New("cannot enable encryption on an existing unencrypted repository")
 	}
 	r.config = config
+	if err := r.openEncryption(options.Passphrase); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -150,6 +185,121 @@ func (r *Repository) setupCodec() error {
 	}
 	r.zstdEncoder, r.zstdDecoder = encoder, decoder
 	return nil
+}
+
+// Compression returns the immutable storage compression policy.
+func (r *Repository) Compression() string { return r.config.Compression }
+
+// Encrypted reports whether chunks and manifests are encrypted at rest.
+func (r *Repository) Encrypted() bool { return r.config.Encryption != nil }
+
+const (
+	encryptionAlgorithm  = "aes-256-gcm"
+	passphraseKDF        = "pbkdf2-hmac-sha256"
+	passphraseIterations = 600000
+)
+
+var keyCheckPlaintext = []byte("vestige repository key check v1")
+var keyCheckAAD = []byte("vestige/config-key-check/v1")
+
+func (r *Repository) configureEncryption(passphrase string) error {
+	salt := make([]byte, 32)
+	if _, err := rand.Read(salt); err != nil {
+		return fmt.Errorf("generate encryption salt: %w", err)
+	}
+	key, err := pbkdf2.Key(sha256.New, passphrase, salt, passphraseIterations, 32)
+	if err != nil {
+		return fmt.Errorf("derive repository key: %w", err)
+	}
+	check, err := seal(key, keyCheckPlaintext, keyCheckAAD)
+	if err != nil {
+		return err
+	}
+	r.key = key
+	r.config.Encryption = &model.EncryptionConfig{
+		Algorithm:  encryptionAlgorithm,
+		KDF:        passphraseKDF,
+		Iterations: passphraseIterations,
+		Salt:       base64.StdEncoding.EncodeToString(salt),
+		KeyCheck:   base64.StdEncoding.EncodeToString(check),
+	}
+	return nil
+}
+
+func (r *Repository) openEncryption(passphrase string) error {
+	if r.config.Encryption == nil {
+		return nil
+	}
+	config := r.config.Encryption
+	if config.Algorithm != encryptionAlgorithm || config.KDF != passphraseKDF || config.Iterations < 100000 {
+		return errors.New("unsupported repository encryption configuration")
+	}
+	if passphrase == "" {
+		return errors.New("repository is encrypted; set VESTIGE_PASSPHRASE before running Vestige")
+	}
+	salt, err := base64.StdEncoding.DecodeString(config.Salt)
+	if err != nil || len(salt) < 16 {
+		return errors.New("invalid repository encryption salt")
+	}
+	check, err := base64.StdEncoding.DecodeString(config.KeyCheck)
+	if err != nil {
+		return errors.New("invalid repository encryption key check")
+	}
+	key, err := pbkdf2.Key(sha256.New, passphrase, salt, config.Iterations, 32)
+	if err != nil {
+		return fmt.Errorf("derive repository key: %w", err)
+	}
+	plain, err := openSealed(key, check, keyCheckAAD)
+	if err != nil || !hmac.Equal(plain, keyCheckPlaintext) {
+		return errors.New("incorrect passphrase or corrupt repository encryption key check")
+	}
+	r.key = key
+	return nil
+}
+
+func (r *Repository) encrypt(data, aad []byte) ([]byte, error) {
+	if r.key == nil {
+		return data, nil
+	}
+	return seal(r.key, data, aad)
+}
+
+func (r *Repository) decrypt(data, aad []byte) ([]byte, error) {
+	if r.key == nil {
+		return data, nil
+	}
+	return openSealed(r.key, data, aad)
+}
+
+func seal(key, plain, aad []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return append(nonce, gcm.Seal(nil, nonce, plain, aad)...), nil
+}
+
+func openSealed(key, sealed, aad []byte) ([]byte, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	if len(sealed) < gcm.NonceSize()+gcm.Overhead() {
+		return nil, errors.New("encrypted data is truncated")
+	}
+	return gcm.Open(nil, sealed[:gcm.NonceSize()], sealed[gcm.NonceSize():], aad)
 }
 
 func (r *Repository) chunkPath(id string) (string, error) {
@@ -179,6 +329,10 @@ func (r *Repository) PutChunk(data []byte) (id string, created bool, storedBytes
 		return "", false, 0, err
 	}
 	stored, err := r.encodeChunk(data)
+	if err != nil {
+		return "", false, 0, err
+	}
+	stored, err = r.encrypt(stored, []byte("vestige/chunk/"+id))
 	if err != nil {
 		return "", false, 0, err
 	}
@@ -222,7 +376,15 @@ func (r *Repository) verifyChunk(id string) error {
 		return fmt.Errorf("open chunk %s: %w", id, err)
 	}
 	defer f.Close()
-	plain, err := r.decodeChunk(f)
+	stored, err := io.ReadAll(f)
+	if err != nil {
+		return fmt.Errorf("read chunk %s: %w", id, err)
+	}
+	stored, err = r.decrypt(stored, []byte("vestige/chunk/"+id))
+	if err != nil {
+		return fmt.Errorf("decrypt chunk %s: %w", id, err)
+	}
+	plain, err := r.decodeChunk(bytes.NewReader(stored))
 	if err != nil {
 		return fmt.Errorf("read chunk %s: %w", id, err)
 	}
@@ -234,16 +396,29 @@ func (r *Repository) verifyChunk(id string) error {
 }
 
 func (r *Repository) readChunk(id string) ([]byte, error) {
-	if err := r.verifyChunk(id); err != nil {
-		return nil, err
-	}
 	path, _ := r.chunkPath(id)
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	return r.decodeChunk(f)
+	stored, err := io.ReadAll(f)
+	if err != nil {
+		return nil, err
+	}
+	stored, err = r.decrypt(stored, []byte("vestige/chunk/"+id))
+	if err != nil {
+		return nil, fmt.Errorf("decrypt chunk %s: %w", id, err)
+	}
+	plain, err := r.decodeChunk(bytes.NewReader(stored))
+	if err != nil {
+		return nil, fmt.Errorf("read chunk %s: %w", id, err)
+	}
+	h := sha256.Sum256(plain)
+	if actual := hex.EncodeToString(h[:]); actual != id {
+		return nil, fmt.Errorf("corrupt chunk %s (hash is %s)", id, actual)
+	}
+	return plain, nil
 }
 
 func (r *Repository) encodeChunk(plain []byte) ([]byte, error) {
@@ -512,8 +687,13 @@ func (r *Repository) publishManifest(m model.Manifest) error {
 		return fmt.Errorf("create snapshot staging area: %w", err)
 	}
 	defer os.RemoveAll(tmp)
-	if err := writeJSONAtomic(filepath.Join(tmp, "manifest.json"), m); err != nil {
+	if err := r.writeManifest(filepath.Join(tmp, r.manifestName()), m); err != nil {
 		return err
+	}
+	if r.beforeSnapshotPublish != nil {
+		if err := r.beforeSnapshotPublish(); err != nil {
+			return err
+		}
 	}
 	if err := os.Rename(tmp, filepath.Join(r.snapshotsDir(), m.SnapshotID)); err != nil {
 		return fmt.Errorf("publish snapshot: %w", err)
@@ -529,9 +709,15 @@ func (r *Repository) ReadManifest(id string) (model.Manifest, error) {
 	if strings.ContainsAny(id, `\\/`) || id == "" {
 		return m, fmt.Errorf("invalid snapshot ID")
 	}
-	b, err := os.ReadFile(filepath.Join(r.snapshotsDir(), id, "manifest.json"))
+	b, err := os.ReadFile(filepath.Join(r.snapshotsDir(), id, r.manifestName()))
 	if err != nil {
 		return m, fmt.Errorf("read snapshot %s: %w", id, err)
+	}
+	if r.key != nil {
+		b, err = r.decrypt(b, []byte("vestige/manifest/"+id))
+		if err != nil {
+			return m, fmt.Errorf("decrypt snapshot %s: %w", id, err)
+		}
 	}
 	if err := json.Unmarshal(b, &m); err != nil {
 		return m, fmt.Errorf("invalid manifest: %w", err)
@@ -987,12 +1173,39 @@ func isWithin(child, parent string) bool {
 	rel, err := filepath.Rel(parent, child)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
+
+func (r *Repository) manifestName() string {
+	if r.key != nil {
+		return "manifest.enc"
+	}
+	return "manifest.json"
+}
+
+func (r *Repository) writeManifest(path string, manifest model.Manifest) error {
+	b, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	b = append(b, '\n')
+	if r.key != nil {
+		b, err = r.encrypt(b, []byte("vestige/manifest/"+manifest.SnapshotID))
+		if err != nil {
+			return err
+		}
+	}
+	return writeAtomic(path, b)
+}
+
 func writeJSONAtomic(path string, value any) error {
 	b, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
+	return writeAtomic(path, b)
+}
+
+func writeAtomic(path string, b []byte) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
 		return err

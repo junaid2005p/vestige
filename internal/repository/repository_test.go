@@ -2,7 +2,11 @@ package repository
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -10,6 +14,7 @@ import (
 	"time"
 
 	"github.com/junaid/vestige/internal/chunker"
+	"github.com/junaid/vestige/internal/model"
 )
 
 func TestBackupRestoreDeduplicatesAndVerifies(t *testing.T) {
@@ -189,6 +194,33 @@ func TestVerifyDetectsCorruptedChunk(t *testing.T) {
 	}
 }
 
+func TestPublicationFailuresDoNotExposePartialObjects(t *testing.T) {
+	r, err := Open(filepath.Join(t.TempDir(), "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.beforeChunkPublish = func() error { return errors.New("injected chunk crash") }
+	if _, _, _, err := r.PutChunk([]byte("never published")); err == nil {
+		t.Fatal("chunk publication unexpectedly succeeded")
+	}
+	idSum := sha256.Sum256([]byte("never published"))
+	path, err := r.chunkPath(hex.EncodeToString(idSum[:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("partial chunk became visible")
+	}
+	r.beforeSnapshotPublish = func() error { return errors.New("injected snapshot crash") }
+	m := model.Manifest{FormatVersion: model.FormatVersion, SnapshotID: "fault-test", CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Files: []model.FileEntry{}}
+	if err := r.publishManifest(m); err == nil {
+		t.Fatal("snapshot publication unexpectedly succeeded")
+	}
+	if _, err := os.Stat(filepath.Join(r.snapshotsDir(), m.SnapshotID)); !os.IsNotExist(err) {
+		t.Fatal("partial snapshot became visible")
+	}
+}
+
 func TestParallelBackupPreservesChunkOrder(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
@@ -220,6 +252,38 @@ func TestParallelBackupPreservesChunkOrder(t *testing.T) {
 	}
 	if string(restored) != string(data) {
 		t.Fatal("parallel backup restored different bytes")
+	}
+}
+
+func TestFileWorkerPipelineBacksUpManyFiles(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		if err := os.WriteFile(filepath.Join(source, fmt.Sprintf("file-%02d", i)), bytes.Repeat([]byte{byte(i)}, 128), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, err := Open(filepath.Join(root, "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, stats, err := r.BackupWithOptions(source, smallConfig(), BackupOptions{Workers: 1, FileWorkers: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Files != 40 {
+		t.Fatalf("files = %d, want 40", stats.Files)
+	}
+	if err := r.Restore(snapshot.SnapshotID, filepath.Join(root, "restored")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		if _, err := os.Stat(filepath.Join(root, "restored", fmt.Sprintf("file-%02d", i))); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -660,6 +724,98 @@ func TestSafeJoinRejectsTraversal(t *testing.T) {
 		if _, err := safeJoin(base, path); err == nil {
 			t.Fatalf("accepted unsafe path %q", path)
 		}
+	}
+}
+
+func TestEncryptedRepositoryProtectsChunksAndManifests(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	repoPath := filepath.Join(root, "repo")
+	destination := filepath.Join(root, "restored")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	secret := []byte("confidential backup content that must not reach disk in plaintext")
+	if err := os.WriteFile(filepath.Join(source, "secret.txt"), secret, 0600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Init(repoPath, RepositoryOptions{Encrypt: true, Passphrase: "correct horse battery staple"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _, err := r.Backup(source, smallConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manifestPath := filepath.Join(repoPath, "snapshots", snapshot.SnapshotID, "manifest.enc")
+	manifest, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(manifest, []byte("secret.txt")) || bytes.Contains(manifest, secret) {
+		t.Fatal("encrypted manifest contains plaintext metadata")
+	}
+	originalManifest := append([]byte(nil), manifest...)
+	if _, err := os.Stat(filepath.Join(repoPath, "snapshots", snapshot.SnapshotID, "manifest.json")); !os.IsNotExist(err) {
+		t.Fatal("encrypted repository wrote a plaintext manifest")
+	}
+	config, err := os.ReadFile(filepath.Join(repoPath, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(config, []byte("correct horse battery staple")) {
+		t.Fatal("repository config persisted the passphrase")
+	}
+	chunkPath, err := r.chunkPath(snapshot.Files[0].Chunks[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := os.ReadFile(chunkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(stored, secret) {
+		t.Fatal("encrypted chunk contains plaintext")
+	}
+
+	if _, err := OpenWithOptions(repoPath, RepositoryOptions{Passphrase: "wrong"}); err == nil {
+		t.Fatal("opened encrypted repository with wrong passphrase")
+	}
+	reopened, err := OpenWithOptions(repoPath, RepositoryOptions{Passphrase: "correct horse battery staple"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Verify(snapshot.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Restore(snapshot.SnapshotID, destination); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := os.ReadFile(filepath.Join(destination, "secret.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(restored, secret) {
+		t.Fatal("restored encrypted content differs")
+	}
+	manifest[len(manifest)-1] ^= 1
+	if err := os.WriteFile(manifestPath, manifest, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.ReadManifest(snapshot.SnapshotID); err == nil {
+		t.Fatal("accepted a tampered encrypted manifest")
+	}
+	if err := os.WriteFile(manifestPath, originalManifest, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	stored[len(stored)-1] ^= 1
+	if err := os.WriteFile(chunkPath, stored, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Verify(snapshot.SnapshotID); err == nil {
+		t.Fatal("verification accepted a tampered encrypted chunk")
 	}
 }
 

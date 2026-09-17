@@ -25,6 +25,25 @@ go run ./cmd/vestige restore .\example-repo <snapshot-id> .\restored
 
 Do not create the repository inside the directory being backed up; Vestige rejects that layout to avoid recursively backing up the repository itself.
 
+## Encryption
+
+Create an encrypted repository by providing a passphrase through the process
+environment (it is never written to the repository) and passing `--encrypt`.
+All later commands against that repository require the same environment value.
+
+```powershell
+$env:VESTIGE_PASSPHRASE = Read-Host "Vestige passphrase"
+go run ./cmd/vestige init --encrypt .\encrypted-repo
+go run ./cmd/vestige backup . .\encrypted-repo
+```
+
+Vestige derives an AES-256-GCM key using PBKDF2-HMAC-SHA-256 with a
+repository-specific random salt. It encrypts chunk payloads and manifests;
+the repository configuration only retains the salt, KDF parameters, and a
+non-secret encrypted key check. Losing the passphrase makes the backup
+unrecoverable, so store it in a password manager or secret manager. Do not put
+the passphrase directly on a command line.
+
 ## Common commands
 
 ```text
