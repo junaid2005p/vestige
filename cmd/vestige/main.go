@@ -42,6 +42,8 @@ func run(args []string) error {
 		return runRecover(args[1:])
 	case "delete":
 		return runDelete(args[1:])
+	case "prune":
+		return runPrune(args[1:])
 	case "bench":
 		return runBench(args[1:])
 	default:
@@ -53,8 +55,8 @@ func usage() {
 	fmt.Print(`Vestige is a local, deduplicating backup engine.
 
 Usage:
-  vestige init [--compression none|gzip|zstd] <repo-dir>
-  vestige backup [--workers N] [--compression none|gzip|zstd] [--message TEXT] [--tags one,two] [--labels key=value] [--include glob] [--exclude glob] [--stale-lock-after DURATION] <source-dir> <repo-dir>
+  vestige init [--compression none|gzip|zstd] [--encrypt] <repo-dir>
+  vestige backup [--workers N] [--file-workers N] [--compression none|gzip|zstd] [--encrypt] [--message TEXT] [--tags one,two] [--labels key=value] [--include glob] [--exclude glob] [--stale-lock-after DURATION] <source-dir> <repo-dir>
   vestige restore [--include glob] [--overwrite] [--clean-destination] <repo-dir> <snapshot-id|latest> <destination-dir>
   vestige restore --stdout <repo-dir> <snapshot-id|latest> <source-relative-file>
   vestige snapshots <repo-dir>
@@ -67,6 +69,7 @@ Usage:
   vestige gc [--dry-run] [--stale-lock-after DURATION] <repo-dir>
   vestige recover --stale-lock-after DURATION <repo-dir>
   vestige delete [--dry-run|--yes] [--stale-lock-after DURATION] <repo-dir> <snapshot-id|latest>
+  vestige prune [--keep-last N] [--keep-daily N] [--keep-weekly N] [--dry-run|--yes] <repo-dir>
   vestige bench --workdir <parent-dir> [--dataset-mib 128] [--trials 3] [--compression none|gzip|zstd] [--profile-dir profiles] [--output results.json]
 `)
 }

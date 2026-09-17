@@ -354,6 +354,11 @@ func (r *Repository) PutChunk(data []byte) (id string, created bool, storedBytes
 	if err != nil {
 		return "", false, 0, err
 	}
+	if r.beforeChunkPublish != nil {
+		if err := r.beforeChunkPublish(); err != nil {
+			return "", false, 0, err
+		}
+	}
 	if err = os.Rename(tmpName, path); err != nil {
 		if _, statErr := os.Stat(path); statErr == nil {
 			if err := r.verifyChunk(id); err != nil {
@@ -523,6 +528,21 @@ func (r *Repository) BackupWithOptions(source string, cfg chunker.Config, option
 		FormatVersion: model.FormatVersion, SnapshotID: id, CreatedAt: now.Format(time.RFC3339Nano), Source: sourceAbs, Description: options.Description, Tags: options.Tags, Labels: options.Labels, Includes: options.Includes, Excludes: options.Excludes,
 		Chunking: model.ChunkingConfig{Algorithm: chunker.Algorithm, Window: cfg.Window, MinSize: cfg.MinSize, TargetSize: cfg.TargetSize, MaxSize: cfg.MaxSize},
 	}
+	type fileJob struct {
+		index int
+		path  string
+		rel   string
+		info  fs.FileInfo
+	}
+	type fileResult struct {
+		index int
+		entry model.FileEntry
+		stats model.BackupStats
+		err   error
+	}
+	var fixedEntries []model.FileEntry
+	var jobs []fileJob
+	hardlinks := make(map[string]string)
 	err = filepath.WalkDir(sourceAbs, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -539,7 +559,15 @@ func (r *Repository) BackupWithOptions(source string, cfg chunker.Config, option
 			return err
 		}
 		if entry.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("unsupported symlink: %s", rel)
+			if !pathFilter.Include(rel) {
+				return nil
+			}
+			target, err := os.Readlink(path)
+			if err != nil {
+				return fmt.Errorf("read symlink %s: %w", rel, err)
+			}
+			fixedEntries = append(fixedEntries, model.FileEntry{Path: rel, Type: "symlink", LinkTarget: target})
+			return nil
 		}
 		fileInfo, err := entry.Info()
 		if err != nil {
@@ -549,7 +577,7 @@ func (r *Repository) BackupWithOptions(source string, cfg chunker.Config, option
 			if pathFilter.Excluded(rel) {
 				return filepath.SkipDir
 			}
-			manifest.Files = append(manifest.Files, model.FileEntry{Path: rel, Type: "directory", Mode: uint32(fileInfo.Mode().Perm()), ModifiedNS: fileInfo.ModTime().UnixNano()})
+			fixedEntries = append(fixedEntries, model.FileEntry{Path: rel, Type: "directory", Mode: uint32(fileInfo.Mode().Perm()), ModifiedNS: fileInfo.ModTime().UnixNano()})
 			return nil
 		}
 		if !pathFilter.Include(rel) {
@@ -558,42 +586,81 @@ func (r *Repository) BackupWithOptions(source string, cfg chunker.Config, option
 		if !fileInfo.Mode().IsRegular() {
 			return fmt.Errorf("unsupported file type: %s", rel)
 		}
-		before := fileInfo
-		f, err := os.Open(path)
-		if err != nil {
-			return fmt.Errorf("open %s: %w", rel, err)
+		if key := hardLinkKey(fileInfo); key != "" {
+			if first, exists := hardlinks[key]; exists {
+				fixedEntries = append(fixedEntries, model.FileEntry{Path: rel, Type: "hardlink", LinkTarget: first, Mode: uint32(fileInfo.Mode().Perm()), ModifiedNS: fileInfo.ModTime().UnixNano()})
+				return nil
+			}
+			hardlinks[key] = rel
 		}
-		entryOut := model.FileEntry{Path: rel, Type: "file", Size: before.Size(), Mode: uint32(before.Mode().Perm()), ModifiedNS: before.ModTime().UnixNano()}
-		processStart := time.Now()
-		refs, fileStats, splitErr := r.storeFileChunks(f, cfg, options.Workers)
-		stats.ProcessingNanos += time.Since(processStart).Nanoseconds()
-		entryOut.Chunks = refs
-		stats.ChunksCreated += fileStats.ChunksCreated
-		stats.ChunksReused += fileStats.ChunksReused
-		stats.BytesWritten += fileStats.BytesWritten
-		err = splitErr
-		closeErr := f.Close()
-		if err == nil {
-			err = closeErr
-		}
-		if err != nil {
-			return fmt.Errorf("backup %s: %w", rel, err)
-		}
-		after, err := os.Stat(path)
-		if err != nil {
-			return fmt.Errorf("stat after reading %s: %w", rel, err)
-		}
-		if after.Size() != before.Size() || after.ModTime() != before.ModTime() {
-			return fmt.Errorf("source file changed during backup: %s", rel)
-		}
-		manifest.Files = append(manifest.Files, entryOut)
-		stats.Files++
-		stats.LogicalBytes += before.Size()
+		jobs = append(jobs, fileJob{index: len(jobs), path: path, rel: rel, info: fileInfo})
 		return nil
 	})
 	if err != nil {
 		return model.Manifest{}, stats, err
 	}
+	fileWorkers := options.FileWorkers
+	if fileWorkers < 1 {
+		fileWorkers = 1
+	}
+	work := make(chan fileJob, fileWorkers*2)
+	results := make(chan fileResult, len(jobs))
+	var filesWG sync.WaitGroup
+	for range fileWorkers {
+		filesWG.Add(1)
+		go func() {
+			defer filesWG.Done()
+			for job := range work {
+				out := fileResult{index: job.index, entry: model.FileEntry{Path: job.rel, Type: "file", Size: job.info.Size(), Mode: uint32(job.info.Mode().Perm()), ModifiedNS: job.info.ModTime().UnixNano()}}
+				f, openErr := os.Open(job.path)
+				if openErr != nil {
+					out.err = fmt.Errorf("open %s: %w", job.rel, openErr)
+					results <- out
+					continue
+				}
+				started := time.Now()
+				// File workers already bound parallelism across independent files;
+				// use one chunk worker here to keep the global work bounded.
+				out.entry.Chunks, out.stats, out.err = r.storeFileChunks(f, cfg, 1)
+				out.stats.ProcessingNanos = time.Since(started).Nanoseconds()
+				if closeErr := f.Close(); out.err == nil {
+					out.err = closeErr
+				}
+				if out.err == nil {
+					after, statErr := os.Stat(job.path)
+					if statErr != nil {
+						out.err = statErr
+					} else if after.Size() != job.info.Size() || after.ModTime() != job.info.ModTime() {
+						out.err = fmt.Errorf("source file changed during backup: %s", job.rel)
+					}
+				}
+				results <- out
+			}
+		}()
+	}
+	go func() {
+		for _, job := range jobs {
+			work <- job
+		}
+		close(work)
+		filesWG.Wait()
+		close(results)
+	}()
+	fileEntries := make([]model.FileEntry, len(jobs))
+	for result := range results {
+		if result.err != nil {
+			return model.Manifest{}, stats, fmt.Errorf("backup %s: %w", result.entry.Path, result.err)
+		}
+		fileEntries[result.index] = result.entry
+		stats.Files++
+		stats.LogicalBytes += result.entry.Size
+		stats.ChunksCreated += result.stats.ChunksCreated
+		stats.ChunksReused += result.stats.ChunksReused
+		stats.BytesWritten += result.stats.BytesWritten
+		stats.ProcessingNanos += result.stats.ProcessingNanos
+	}
+	manifest.Files = append(fixedEntries, fileEntries...)
+	sort.Slice(manifest.Files, func(i, j int) bool { return manifest.Files[i].Path < manifest.Files[j].Path })
 	if err := r.publishManifest(manifest); err != nil {
 		return model.Manifest{}, stats, err
 	}
@@ -884,7 +951,7 @@ func (r *Repository) RestoreWithOptions(id, destination string, options RestoreO
 		entry model.FileEntry
 	}
 	for _, entry := range m.Files {
-		if entry.Type == "file" && !pathFilter.Include(entry.Path) {
+		if (entry.Type == "file" || entry.Type == "symlink" || entry.Type == "hardlink") && !pathFilter.Include(entry.Path) {
 			continue
 		}
 		if entry.Type == "directory" && len(options.Includes) > 0 {
@@ -902,6 +969,34 @@ func (r *Repository) RestoreWithOptions(id, destination string, options RestoreO
 				path  string
 				entry model.FileEntry
 			}{path: path, entry: entry})
+			continue
+		}
+		if entry.Type == "symlink" {
+			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+				return err
+			}
+			if options.Overwrite {
+				_ = os.Remove(path)
+			}
+			if err := os.Symlink(entry.LinkTarget, path); err != nil {
+				return fmt.Errorf("restore symlink %s: %w", entry.Path, err)
+			}
+			continue
+		}
+		if entry.Type == "hardlink" {
+			target, err := safeJoin(dest, entry.LinkTarget)
+			if err != nil {
+				return fmt.Errorf("restore hard link %s: %w", entry.Path, err)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+				return err
+			}
+			if options.Overwrite {
+				_ = os.Remove(path)
+			}
+			if err := os.Link(target, path); err != nil {
+				return fmt.Errorf("restore hard link %s: %w", entry.Path, err)
+			}
 			continue
 		}
 		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -1059,12 +1154,19 @@ func (r *Repository) Verify(snapshotID string) error {
 			return err
 		}
 	}
+	// Chunks are content-addressed and may appear in many files and snapshots.
+	// Verify each physical object once per invocation.
+	verified := make(map[string]struct{})
 	for _, m := range manifests {
 		for _, entry := range m.Files {
 			for _, ref := range entry.Chunks {
+				if _, ok := verified[ref.ID]; ok {
+					continue
+				}
 				if err := r.verifyChunk(ref.ID); err != nil {
 					return fmt.Errorf("snapshot %s, file %s: %w", m.SnapshotID, entry.Path, err)
 				}
+				verified[ref.ID] = struct{}{}
 			}
 		}
 	}
@@ -1122,7 +1224,7 @@ func validateManifest(m model.Manifest) error {
 			return fmt.Errorf("duplicate manifest path %q", e.Path)
 		}
 		seen[e.Path] = struct{}{}
-		if e.Type != "file" && e.Type != "directory" {
+		if e.Type != "file" && e.Type != "directory" && e.Type != "symlink" && e.Type != "hardlink" {
 			return fmt.Errorf("invalid entry type for %q", e.Path)
 		}
 		if e.Type == "file" {
@@ -1137,8 +1239,28 @@ func validateManifest(m model.Manifest) error {
 				return fmt.Errorf("incorrect size for %q", e.Path)
 			}
 		}
+		if e.Type == "hardlink" {
+			if err := validatePath(e.LinkTarget); err != nil {
+				return fmt.Errorf("invalid hard link target for %q", e.Path)
+			}
+		}
+		if e.Type == "symlink" && e.LinkTarget == "" {
+			return fmt.Errorf("empty symlink target for %q", e.Path)
+		}
 	}
 	return nil
+}
+
+// hardLinkKey is deliberately disabled on Windows: os.FileInfo does not
+// expose a stable file identifier there through the portable API. Unix stat
+// data has a stable device/inode representation, and formatting it is enough
+// to recognize aliases during one walk without storing platform details in
+// the manifest format.
+func hardLinkKey(info fs.FileInfo) string {
+	if runtime.GOOS == "windows" || info == nil || info.Sys() == nil {
+		return ""
+	}
+	return fmt.Sprintf("%T:%v", info.Sys(), info.Sys())
 }
 
 func rChunkPath(id string) (string, error) {
