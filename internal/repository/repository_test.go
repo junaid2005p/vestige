@@ -2,7 +2,9 @@ package repository
 
 import (
 	"bytes"
+	"crypto/pbkdf2"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -976,6 +978,219 @@ func TestEncryptedRepositoryProtectsChunksAndManifests(t *testing.T) {
 	}
 	if err := reopened.Verify(snapshot.SnapshotID); err == nil {
 		t.Fatal("verification accepted a tampered encrypted chunk")
+	}
+}
+
+func TestRotatePassphraseRewrapsDataKey(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	repoPath := filepath.Join(root, "repo")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "file.txt"), []byte("rotate without rewriting chunks"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Init(repoPath, RepositoryOptions{Encrypt: true, Passphrase: "old passphrase"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _, err := r.Backup(source, smallConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunkPath, err := r.chunkPath(snapshot.Files[0].Chunks[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(chunkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.RotatePassphrase("new passphrase", 0); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(chunkPath)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("rotation rewrote chunk: %v", err)
+	}
+	if _, err := OpenWithOptions(repoPath, RepositoryOptions{Passphrase: "old passphrase"}); err == nil {
+		t.Fatal("old passphrase still opened repository")
+	}
+	reopened, err := OpenWithOptions(repoPath, RepositoryOptions{Passphrase: "new passphrase"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Verify(snapshot.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRotatePassphraseUpgradesLegacyEncryptedRepository(t *testing.T) {
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "file.txt"), []byte("legacy rotation"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Open(repoPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt := bytes.Repeat([]byte{7}, 32)
+	legacyKey, err := pbkdf2.Key(sha256.New, "old passphrase", salt, passphraseIterations, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check, err := seal(legacyKey, keyCheckPlaintext, keyCheckAAD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.key = legacyKey
+	r.config.Encryption = &model.EncryptionConfig{Algorithm: encryptionAlgorithm, KDF: passphraseKDF, Iterations: passphraseIterations, Salt: base64.StdEncoding.EncodeToString(salt), KeyCheck: base64.StdEncoding.EncodeToString(check)}
+	configData, err := marshalJSON(r.config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, version, err := r.store.Get("config.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.store.ReplaceIfVersion("config.json", configData, version); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _, err := r.Backup(source, smallConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunkPath, err := r.chunkPath(snapshot.Files[0].Chunks[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(chunkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.RotatePassphrase("new passphrase", 0); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(chunkPath)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("legacy rotation rewrote chunk: %v", err)
+	}
+	reopened, err := OpenWithOptions(repoPath, RepositoryOptions{Passphrase: "new passphrase"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Verify(snapshot.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReplicateEncryptedRepository(t *testing.T) {
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "source")
+	if err := os.Mkdir(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "file.txt"), []byte("encrypted off-site copy"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := Init(filepath.Join(root, "source-repo"), RepositoryOptions{Encrypt: true, Passphrase: "source passphrase"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _, err := source.Backup(sourceDir, smallConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := Init(filepath.Join(root, "target-repo"), RepositoryOptions{Encrypt: true, Passphrase: "target passphrase"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stats, err := source.ReplicateTo(target, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.SnapshotsCopied != 1 || stats.ChunksCopied == 0 {
+		t.Fatalf("unexpected replication stats: %+v", stats)
+	}
+	if err := target.Verify(snapshot.SnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(root, "restored")
+	if err := target.Restore(snapshot.SnapshotID, destination); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(destination, "file.txt"))
+	if err != nil || string(got) != "encrypted off-site copy" {
+		t.Fatalf("replicated restore = %q, %v", got, err)
+	}
+	second, err := source.ReplicateTo(target, 0)
+	if err != nil || second.SnapshotsSkipped != 1 {
+		t.Fatalf("repeat replication = %+v, %v", second, err)
+	}
+}
+
+func TestRecoveryKitValidatesAwayFromRepository(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	repoPath := filepath.Join(root, "repo")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "file.txt"), []byte("recovery metadata"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Init(repoPath, RepositoryOptions{Encrypt: true, Passphrase: "kit passphrase"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.Backup(source, smallConfig()); err != nil {
+		t.Fatal(err)
+	}
+	kit := filepath.Join(root, "recovery-kit.zip")
+	exported, err := r.ExportRecoveryKit(kit)
+	if err != nil || exported.Snapshots != 1 {
+		t.Fatalf("export recovery kit = %+v, %v", exported, err)
+	}
+	validated, err := ValidateRecoveryKit(kit, "kit passphrase")
+	if err != nil || validated.Snapshots != 1 {
+		t.Fatalf("validate recovery kit = %+v, %v", validated, err)
+	}
+	if _, err := ValidateRecoveryKit(kit, "wrong passphrase"); err == nil {
+		t.Fatal("validated kit with wrong passphrase")
+	}
+}
+
+func TestDisasterRecoveryDrillRestoresSnapshot(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "file.txt"), []byte("disaster drill"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Open(filepath.Join(root, "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _, err := r.Backup(source, smallConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(root, "restored")
+	report, err := r.DisasterRecoveryDrill(snapshot.SnapshotID, destination)
+	if err != nil || report.SnapshotID != snapshot.SnapshotID || report.Files != 1 || report.RPOSeconds < 0 || report.RTOSeconds < 0 {
+		t.Fatalf("drill = %+v, %v", report, err)
+	}
+	got, err := os.ReadFile(filepath.Join(destination, "file.txt"))
+	if err != nil || string(got) != "disaster drill" {
+		t.Fatalf("drill restore = %q, %v", got, err)
 	}
 }
 
