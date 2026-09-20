@@ -37,3 +37,43 @@ func TestCheckAndVerifyJSONCommands(t *testing.T) {
 		t.Fatal("successful CLI verification left a checkpoint behind")
 	}
 }
+
+func TestSecurityRecoveryCommands(t *testing.T) {
+	root := t.TempDir()
+	sourceDir := filepath.Join(root, "source")
+	sourceRepo := filepath.Join(root, "source-repo")
+	targetRepo := filepath.Join(root, "target-repo")
+	if err := os.Mkdir(sourceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sourceDir, "file.txt"), []byte("security command test"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	source, err := repository.Init(sourceRepo, repository.RepositoryOptions{Encrypt: true, Passphrase: "source passphrase"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := source.Backup(sourceDir, chunker.DefaultConfig()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.Init(targetRepo, repository.RepositoryOptions{Encrypt: true, Passphrase: "target passphrase"}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VESTIGE_SOURCE_PASSPHRASE", "source passphrase")
+	t.Setenv("VESTIGE_TARGET_PASSPHRASE", "target passphrase")
+	if err := runReplicate([]string{sourceRepo, targetRepo}); err != nil {
+		t.Fatalf("replicate command: %v", err)
+	}
+	t.Setenv("VESTIGE_PASSPHRASE", "source passphrase")
+	kit := filepath.Join(root, "kit.zip")
+	if err := runRecoveryKit([]string{"export", sourceRepo, kit}); err != nil {
+		t.Fatalf("recovery-kit export: %v", err)
+	}
+	if err := runRecoveryKit([]string{"validate", kit}); err != nil {
+		t.Fatalf("recovery-kit validate: %v", err)
+	}
+	t.Setenv("VESTIGE_PASSPHRASE", "target passphrase")
+	if err := runDrill([]string{"--json", targetRepo, filepath.Join(root, "drill")}); err != nil {
+		t.Fatalf("drill command: %v", err)
+	}
+}

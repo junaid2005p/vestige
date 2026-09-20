@@ -232,26 +232,36 @@ const (
 
 var keyCheckPlaintext = []byte("vestige repository key check v1")
 var keyCheckAAD = []byte("vestige/config-key-check/v1")
+var wrappedKeyAAD = []byte("vestige/config-wrapped-key/v1")
 
 func (r *Repository) configureEncryption(passphrase string) error {
 	salt := make([]byte, 32)
 	if _, err := rand.Read(salt); err != nil {
 		return fmt.Errorf("generate encryption salt: %w", err)
 	}
-	key, err := pbkdf2.Key(sha256.New, passphrase, salt, passphraseIterations, 32)
+	wrappingKey, err := pbkdf2.Key(sha256.New, passphrase, salt, passphraseIterations, 32)
 	if err != nil {
 		return fmt.Errorf("derive repository key: %w", err)
 	}
-	check, err := seal(key, keyCheckPlaintext, keyCheckAAD)
+	dataKey := make([]byte, 32)
+	if _, err := rand.Read(dataKey); err != nil {
+		return fmt.Errorf("generate repository data key: %w", err)
+	}
+	wrappedKey, err := seal(wrappingKey, dataKey, wrappedKeyAAD)
 	if err != nil {
 		return err
 	}
-	r.key = key
+	check, err := seal(dataKey, keyCheckPlaintext, keyCheckAAD)
+	if err != nil {
+		return err
+	}
+	r.key = dataKey
 	r.config.Encryption = &model.EncryptionConfig{
 		Algorithm:  encryptionAlgorithm,
 		KDF:        passphraseKDF,
 		Iterations: passphraseIterations,
 		Salt:       base64.StdEncoding.EncodeToString(salt),
+		WrappedKey: base64.StdEncoding.EncodeToString(wrappedKey),
 		KeyCheck:   base64.StdEncoding.EncodeToString(check),
 	}
 	return nil
@@ -276,15 +286,73 @@ func (r *Repository) openEncryption(passphrase string) error {
 	if err != nil {
 		return errors.New("invalid repository encryption key check")
 	}
-	key, err := pbkdf2.Key(sha256.New, passphrase, salt, config.Iterations, 32)
+	wrappingKey, err := pbkdf2.Key(sha256.New, passphrase, salt, config.Iterations, 32)
 	if err != nil {
 		return fmt.Errorf("derive repository key: %w", err)
+	}
+	key := wrappingKey
+	if config.WrappedKey != "" {
+		wrappedKey, err := base64.StdEncoding.DecodeString(config.WrappedKey)
+		if err != nil {
+			return errors.New("invalid wrapped repository key")
+		}
+		key, err = openSealed(wrappingKey, wrappedKey, wrappedKeyAAD)
+		if err != nil || len(key) != 32 {
+			return errors.New("incorrect passphrase or corrupt wrapped repository key")
+		}
 	}
 	plain, err := openSealed(key, check, keyCheckAAD)
 	if err != nil || !hmac.Equal(plain, keyCheckPlaintext) {
 		return errors.New("incorrect passphrase or corrupt repository encryption key check")
 	}
 	r.key = key
+	return nil
+}
+
+// RotatePassphrase rewrites only the encrypted repository configuration. Data
+// chunks and snapshot manifests keep the same data key and are not rewritten.
+func (r *Repository) RotatePassphrase(newPassphrase string, staleAfter time.Duration) error {
+	if r.config.Encryption == nil {
+		return errors.New("repository is not encrypted")
+	}
+	if newPassphrase == "" {
+		return errors.New("new passphrase is required")
+	}
+	lock, err := r.acquireWriteLock(staleAfter)
+	if err != nil {
+		return err
+	}
+	defer lock.release()
+	salt := make([]byte, 32)
+	if _, err := rand.Read(salt); err != nil {
+		return fmt.Errorf("generate encryption salt: %w", err)
+	}
+	wrappingKey, err := pbkdf2.Key(sha256.New, newPassphrase, salt, passphraseIterations, 32)
+	if err != nil {
+		return fmt.Errorf("derive repository key: %w", err)
+	}
+	wrappedKey, err := seal(wrappingKey, r.key, wrappedKeyAAD)
+	if err != nil {
+		return err
+	}
+	updated := r.config
+	updated.Encryption = &model.EncryptionConfig{
+		Algorithm: encryptionAlgorithm, KDF: passphraseKDF, Iterations: passphraseIterations,
+		Salt: base64.StdEncoding.EncodeToString(salt), WrappedKey: base64.StdEncoding.EncodeToString(wrappedKey),
+		KeyCheck: r.config.Encryption.KeyCheck,
+	}
+	b, err := marshalJSON(updated)
+	if err != nil {
+		return err
+	}
+	_, version, err := r.store.Get("config.json")
+	if err != nil {
+		return fmt.Errorf("read repository config: %w", err)
+	}
+	if _, err := r.store.ReplaceIfVersion("config.json", b, version); err != nil {
+		return fmt.Errorf("update repository key wrapper: %w", err)
+	}
+	r.config = updated
 	return nil
 }
 

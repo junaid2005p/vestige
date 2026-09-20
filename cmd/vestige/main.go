@@ -36,6 +36,14 @@ func run(args []string) error {
 		return runStats(args[1:])
 	case "verify":
 		return runVerify(args[1:])
+	case "key":
+		return runKey(args[1:])
+	case "replicate":
+		return runReplicate(args[1:])
+	case "recovery-kit":
+		return runRecoveryKit(args[1:])
+	case "drill":
+		return runDrill(args[1:])
 	case "check":
 		return runCheck(args[1:])
 	case "gc":
@@ -68,6 +76,11 @@ Usage:
   vestige diff <repo-dir> <older-snapshot-id|latest> <newer-snapshot-id|latest>
   vestige stats <repo-dir>
   vestige verify [--json] [--state checkpoint.json] <repo-dir> [snapshot-id|latest]
+  vestige key rotate <repo-dir>
+  vestige replicate <source-repo> <target-repo>
+  vestige recovery-kit export <repo-dir> <kit.zip>
+  vestige recovery-kit validate <kit.zip>
+  vestige drill [--snapshot snapshot-id|latest] [--json] <repo-dir> <empty-destination-dir>
   vestige check [--json] <repo-dir>
   vestige gc [--dry-run] [--stale-lock-after DURATION] <repo-dir>
   vestige recover --stale-lock-after DURATION <repo-dir>

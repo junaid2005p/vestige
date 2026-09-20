@@ -38,11 +38,20 @@ go run ./cmd/vestige backup . .\encrypted-repo
 ```
 
 Vestige derives an AES-256-GCM key using PBKDF2-HMAC-SHA-256 with a
-repository-specific random salt. It encrypts chunk payloads and manifests;
-the repository configuration only retains the salt, KDF parameters, and a
+repository-specific random salt, then uses it to wrap a random repository data
+key. That data key encrypts chunk payloads and manifests; the repository
+configuration retains only the salt, KDF parameters, wrapped data key, and a
 non-secret encrypted key check. Losing the passphrase makes the backup
 unrecoverable, so store it in a password manager or secret manager. Do not put
 the passphrase directly on a command line.
+
+To rotate a passphrase, set both environment variables and rewrap the data key.
+Chunks and manifests are not rewritten.
+
+```powershell
+$env:VESTIGE_NEW_PASSPHRASE = Read-Host "New Vestige passphrase"
+go run ./cmd/vestige key rotate .\encrypted-repo
+```
 
 ## S3-compatible repositories
 
@@ -87,6 +96,11 @@ vestige restore [--include glob] [--overwrite] [--clean-destination] <repo-dir> 
 vestige restore --stdout <repo-dir> <snapshot-id|latest> <source-relative-file>
 vestige verify [--json] [--state checkpoint.json] <repo-dir> [snapshot-id|latest]
 vestige check [--json] <repo-dir>
+vestige key rotate <repo-dir>
+vestige replicate <source-repo> <target-repo>
+vestige recovery-kit export <repo-dir> <kit.zip>
+vestige recovery-kit validate <kit.zip>
+vestige drill [--snapshot snapshot-id|latest] [--json] <repo-dir> <empty-destination-dir>
 vestige delete [--dry-run|--yes] <repo-dir> <snapshot-id|latest>
 vestige gc [--dry-run] <repo-dir>
 ```
@@ -104,6 +118,21 @@ in [FORMAT.md](FORMAT.md).
 `verify` reads and hashes every unique referenced chunk. `--state` persists a
 local checkpoint after each verified chunk, so rerunning the same command can
 resume after an interruption; its checkpoint is removed after success.
+
+## Recovery operations
+
+`replicate` copies an encrypted repository to another encrypted repository,
+decrypting only in memory and encrypting with the target's independent data
+key. Set `VESTIGE_SOURCE_PASSPHRASE` and `VESTIGE_TARGET_PASSPHRASE` when the
+repositories use different passphrases; both repositories must use the same
+compression mode.
+
+`recovery-kit export` writes encrypted configuration and manifests, but no
+chunks or passphrase, to a new ZIP file. Validate it on another machine with
+`VESTIGE_PASSPHRASE`. `drill` restores a selected snapshot into a new empty
+destination and reports RPO and restore duration (RTO).
+
+Read [SECURITY.md](SECURITY.md) before using a remote repository in production.
 
 ## Benchmarking
 
