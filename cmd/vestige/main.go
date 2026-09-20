@@ -36,6 +36,8 @@ func run(args []string) error {
 		return runStats(args[1:])
 	case "verify":
 		return runVerify(args[1:])
+	case "check":
+		return runCheck(args[1:])
 	case "gc":
 		return runGC(args[1:])
 	case "recover":
@@ -65,7 +67,8 @@ Usage:
   vestige find --chunk <sha256> <repo-dir> <snapshot-id|latest>
   vestige diff <repo-dir> <older-snapshot-id|latest> <newer-snapshot-id|latest>
   vestige stats <repo-dir>
-  vestige verify <repo-dir> [snapshot-id|latest]
+  vestige verify [--json] [--state checkpoint.json] <repo-dir> [snapshot-id|latest]
+  vestige check [--json] <repo-dir>
   vestige gc [--dry-run] [--stale-lock-after DURATION] <repo-dir>
   vestige recover --stale-lock-after DURATION <repo-dir>
   vestige delete [--dry-run|--yes] [--stale-lock-after DURATION] <repo-dir> <snapshot-id|latest>

@@ -85,7 +85,8 @@ vestige diff <repo-dir> <older-snapshot-id|latest> <newer-snapshot-id|latest>
 vestige find <repo-dir> <snapshot-id|latest> <glob>
 vestige restore [--include glob] [--overwrite] [--clean-destination] <repo-dir> <snapshot-id|latest> <destination-dir>
 vestige restore --stdout <repo-dir> <snapshot-id|latest> <source-relative-file>
-vestige verify <repo-dir> [snapshot-id|latest]
+vestige verify [--json] [--state checkpoint.json] <repo-dir> [snapshot-id|latest]
+vestige check [--json] <repo-dir>
 vestige delete [--dry-run|--yes] <repo-dir> <snapshot-id|latest>
 vestige gc [--dry-run] <repo-dir>
 ```
@@ -93,6 +94,16 @@ vestige gc [--dry-run] <repo-dir>
 `latest` may be used anywhere a snapshot ID is accepted; it resolves to the newest published snapshot. `restore` refuses an existing destination by default. Use `--overwrite` to replace only restored paths; `--clean-destination` additionally clears the destination and requires `--overwrite`. Restore validates every chunk before writing it.
 
 `backup` accepts comma-separated, source-relative `path.Match` patterns for `--include` and `--exclude`; exclusions win. It can also record a message, tags, and immutable `key=value` labels with each snapshot.
+
+`check` is a read-only repository consistency scan. It detects invalid
+manifests, missing or corrupt referenced chunks, and unreferenced chunks; use
+`--json` for automation. Run it before `gc` when investigating a damaged
+repository. The repository format and forward-migration policy are documented
+in [FORMAT.md](FORMAT.md).
+
+`verify` reads and hashes every unique referenced chunk. `--state` persists a
+local checkpoint after each verified chunk, so rerunning the same command can
+resume after an interruption; its checkpoint is removed after success.
 
 ## Benchmarking
 

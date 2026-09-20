@@ -1153,37 +1153,8 @@ func applyMetadata(path string, entry model.FileEntry) error {
 }
 
 func (r *Repository) Verify(snapshotID string) error {
-	var manifests []model.Manifest
-	if snapshotID != "" {
-		m, err := r.ReadManifest(snapshotID)
-		if err != nil {
-			return err
-		}
-		manifests = []model.Manifest{m}
-	} else {
-		var err error
-		manifests, err = r.Snapshots()
-		if err != nil {
-			return err
-		}
-	}
-	// Chunks are content-addressed and may appear in many files and snapshots.
-	// Verify each physical object once per invocation.
-	verified := make(map[string]struct{})
-	for _, m := range manifests {
-		for _, entry := range m.Files {
-			for _, ref := range entry.Chunks {
-				if _, ok := verified[ref.ID]; ok {
-					continue
-				}
-				if err := r.verifyChunk(ref.ID); err != nil {
-					return fmt.Errorf("snapshot %s, file %s: %w", m.SnapshotID, entry.Path, err)
-				}
-				verified[ref.ID] = struct{}{}
-			}
-		}
-	}
-	return nil
+	_, err := r.VerifyWithOptions(snapshotID, VerifyOptions{})
+	return err
 }
 
 // Stats reports physical chunk bytes and logical bytes across all snapshots.

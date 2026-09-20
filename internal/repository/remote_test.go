@@ -22,6 +22,27 @@ import (
 // this test protects the manifest-as-commit protocol used by every backend.
 type memoryStore struct{ objects map[string][]byte }
 
+// faultStore injects object-store failures for tests.
+type faultStore struct {
+	objectStore
+	getErr error
+	putErr error
+}
+
+func (s faultStore) Get(key string) ([]byte, string, error) {
+	if s.getErr != nil {
+		return nil, "", s.getErr
+	}
+	return s.objectStore.Get(key)
+}
+
+func (s faultStore) PutIfAbsent(key string, data []byte) (string, error) {
+	if s.putErr != nil {
+		return "", s.putErr
+	}
+	return s.objectStore.PutIfAbsent(key, data)
+}
+
 func (s *memoryStore) Get(key string) ([]byte, string, error) {
 	b, ok := s.objects[key]
 	if !ok {
@@ -129,6 +150,39 @@ func TestRemoteRepositoryBackupRestoreAndDelete(t *testing.T) {
 	}
 	if _, err := reopened.ReadManifest(m.SnapshotID); !errors.Is(err, errObjectNotFound) {
 		t.Fatalf("deleted manifest error = %v, want not found", err)
+	}
+}
+
+func TestObjectStoreFaultsDoNotPublishPartialSnapshots(t *testing.T) {
+	backing := &memoryStore{objects: map[string][]byte{}}
+	faults := &faultStore{objectStore: backing}
+	r := openRemoteTestRepository(t, faults)
+	source := filepath.Join(t.TempDir(), "source")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "file.txt"), []byte("network and disk fault fixture"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// A failed write covers both a connection loss during upload and a local
+	// storage-full error: neither may publish a manifest commit record.
+	faults.putErr = errors.New("injected upload failure")
+	if _, _, err := r.Backup(source, chunker.DefaultConfig()); err == nil {
+		t.Fatal("backup unexpectedly survived a failed chunk write")
+	}
+	if snapshots, err := r.Snapshots(); err != nil || len(snapshots) != 0 {
+		t.Fatalf("failed backup published snapshots: %v, %v", snapshots, err)
+	}
+	faults.putErr = nil
+	snapshot, _, err := r.Backup(source, chunker.DefaultConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A read-side network loss must be surfaced rather than treated as a clean
+	// verification result.
+	faults.getErr = errors.New("injected connection reset")
+	if err := r.Verify(snapshot.SnapshotID); err == nil {
+		t.Fatal("verify unexpectedly accepted a failed object read")
 	}
 }
 
