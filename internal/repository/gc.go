@@ -2,9 +2,7 @@ package repository
 
 import (
 	"fmt"
-	"io/fs"
-	"os"
-	"path/filepath"
+	"path"
 	"time"
 )
 
@@ -43,29 +41,22 @@ func (r *Repository) GarbageCollect(dryRun bool, staleAfter time.Duration) (GCSt
 		}
 	}
 	stats.ReachableChunks = len(live)
-	err = filepath.WalkDir(r.chunksDir(), func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		id := entry.Name()
+	objects, err := r.store.List("chunks/")
+	if err != nil {
+		return stats, err
+	}
+	for _, object := range objects {
+		id := path.Base(object.Key)
 		if _, ok := live[id]; ok {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
+			continue
 		}
 		stats.OrphanChunks++
-		stats.ReclaimedBytes += info.Size()
+		stats.ReclaimedBytes += object.Size
 		if !dryRun {
-			if err := os.Remove(path); err != nil {
-				return fmt.Errorf("remove orphan chunk %s: %w", path, err)
+			if err := r.store.Delete(object.Key); err != nil {
+				return stats, fmt.Errorf("remove orphan chunk %s: %w", id, err)
 			}
 		}
-		return nil
-	})
-	return stats, err
+	}
+	return stats, nil
 }

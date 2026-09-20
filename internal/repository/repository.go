@@ -33,6 +33,8 @@ import (
 
 type Repository struct {
 	Root        string
+	store       objectStore
+	remote      bool
 	config      model.RepositoryConfig
 	key         []byte
 	zstdEncoder *zstd.Encoder
@@ -50,6 +52,13 @@ type RepositoryOptions struct {
 	Encrypt bool
 	// Passphrase is used only to derive the repository key and is never stored.
 	Passphrase string
+	// S3Endpoint overrides the AWS endpoint for S3-compatible services. Prefer
+	// VESTIGE_S3_ENDPOINT for normal CLI use so every command shares it.
+	S3Endpoint string
+	// S3Region selects the AWS region. VESTIGE_S3_REGION takes the same role.
+	S3Region string
+	// S3PathStyle enables path-style requests for compatible services such as MinIO.
+	S3PathStyle bool
 }
 
 // Init creates a repository using the requested immutable storage policy.
@@ -93,16 +102,26 @@ func Open(root string) (*Repository, error) {
 }
 
 func OpenWithOptions(root string, options RepositoryOptions) (*Repository, error) {
-	abs, err := filepath.Abs(root)
-	if err != nil {
-		return nil, err
-	}
 	if options.Compression != "" && options.Compression != "none" && options.Compression != "gzip" && options.Compression != "zstd" {
 		return nil, fmt.Errorf("unsupported compression %q (choose none, gzip, or zstd)", options.Compression)
 	}
-	r := &Repository{Root: filepath.Clean(abs)}
-	if err := os.MkdirAll(r.Root, 0755); err != nil {
-		return nil, err
+	r := &Repository{}
+	if strings.HasPrefix(strings.ToLower(root), "s3://") {
+		store, normalized, err := newS3Store(root, options)
+		if err != nil {
+			return nil, err
+		}
+		r.Root, r.store, r.remote = normalized, store, true
+	} else {
+		abs, err := filepath.Abs(root)
+		if err != nil {
+			return nil, err
+		}
+		r.Root = filepath.Clean(abs)
+		if err := os.MkdirAll(r.Root, 0755); err != nil {
+			return nil, err
+		}
+		r.store = localStore{root: r.Root}
 	}
 	if err := r.ensureConfig(options); err != nil {
 		return nil, err
@@ -110,9 +129,11 @@ func OpenWithOptions(root string, options RepositoryOptions) (*Repository, error
 	if err := r.setupCodec(); err != nil {
 		return nil, err
 	}
-	for _, dir := range []string{r.chunksDir(), r.snapshotsDir(), r.tmpDir()} {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return nil, err
+	if !r.remote {
+		for _, dir := range []string{r.chunksDir(), r.snapshotsDir(), r.tmpDir()} {
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return r, nil
@@ -124,9 +145,8 @@ func (r *Repository) snapshotsDir() string { return filepath.Join(r.Root, "snaps
 func (r *Repository) tmpDir() string       { return filepath.Join(r.Root, "tmp") }
 
 func (r *Repository) ensureConfig(options RepositoryOptions) error {
-	path := r.configPath()
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	b, _, err := r.store.Get("config.json")
+	if errors.Is(err, errObjectNotFound) {
 		if options.Compression == "" {
 			options.Compression = "none"
 		}
@@ -139,7 +159,18 @@ func (r *Repository) ensureConfig(options RepositoryOptions) error {
 				return err
 			}
 		}
-		return writeJSONAtomic(path, r.config)
+		config, err := marshalJSON(r.config)
+		if err != nil {
+			return err
+		}
+		if _, err := r.store.PutIfAbsent("config.json", config); err == nil {
+			return nil
+		} else if !errors.Is(err, errObjectExists) {
+			return fmt.Errorf("create repository config: %w", err)
+		}
+		// Another writer initialized the repository first; read and validate its
+		// immutable policy instead of overwriting it.
+		b, _, err = r.store.Get("config.json")
 	}
 	if err != nil {
 		return fmt.Errorf("read repository config: %w", err)
@@ -312,20 +343,27 @@ func (r *Repository) chunkPath(id string) (string, error) {
 	return filepath.Join(r.chunksDir(), id[:2], id[2:4], id), nil
 }
 
+func (r *Repository) chunkKey(id string) (string, error) {
+	if _, err := r.chunkPath(id); err != nil {
+		return "", err
+	}
+	return "chunks/" + id[:2] + "/" + id[2:4] + "/" + id, nil
+}
+
 // PutChunk stores data exactly once. Existing chunks are rehashed before reuse.
 func (r *Repository) PutChunk(data []byte) (id string, created bool, storedBytes int64, err error) {
 	sum := sha256.Sum256(data)
 	id = hex.EncodeToString(sum[:])
-	path, err := r.chunkPath(id)
+	key, err := r.chunkKey(id)
 	if err != nil {
 		return "", false, 0, err
 	}
-	if _, err = os.Stat(path); err == nil {
+	if _, _, err = r.store.Get(key); err == nil {
 		if err := r.verifyChunk(id); err != nil {
 			return "", false, 0, err
 		}
 		return id, false, 0, nil
-	} else if !errors.Is(err, os.ErrNotExist) {
+	} else if !errors.Is(err, errObjectNotFound) {
 		return "", false, 0, err
 	}
 	stored, err := r.encodeChunk(data)
@@ -336,54 +374,31 @@ func (r *Repository) PutChunk(data []byte) (id string, created bool, storedBytes
 	if err != nil {
 		return "", false, 0, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return "", false, 0, err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".chunk-*")
-	if err != nil {
-		return "", false, 0, err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err = tmp.Write(stored); err == nil {
-		err = tmp.Sync()
-	}
-	if closeErr := tmp.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return "", false, 0, err
-	}
 	if r.beforeChunkPublish != nil {
 		if err := r.beforeChunkPublish(); err != nil {
 			return "", false, 0, err
 		}
 	}
-	if err = os.Rename(tmpName, path); err != nil {
-		if _, statErr := os.Stat(path); statErr == nil {
+	if _, err = r.store.PutIfAbsent(key, stored); err != nil {
+		if errors.Is(err, errObjectExists) {
 			if err := r.verifyChunk(id); err != nil {
 				return "", false, 0, err
 			}
 			return id, false, 0, nil
 		}
-		return "", false, 0, err
+		return "", false, 0, fmt.Errorf("store chunk %s: %w", id, err)
 	}
 	return id, true, int64(len(stored)), nil
 }
 
 func (r *Repository) verifyChunk(id string) error {
-	path, err := r.chunkPath(id)
+	key, err := r.chunkKey(id)
 	if err != nil {
 		return err
 	}
-	f, err := os.Open(path)
+	stored, _, err := r.store.Get(key)
 	if err != nil {
 		return fmt.Errorf("open chunk %s: %w", id, err)
-	}
-	defer f.Close()
-	stored, err := io.ReadAll(f)
-	if err != nil {
-		return fmt.Errorf("read chunk %s: %w", id, err)
 	}
 	stored, err = r.decrypt(stored, []byte("vestige/chunk/"+id))
 	if err != nil {
@@ -401,13 +416,11 @@ func (r *Repository) verifyChunk(id string) error {
 }
 
 func (r *Repository) readChunk(id string) ([]byte, error) {
-	path, _ := r.chunkPath(id)
-	f, err := os.Open(path)
+	key, err := r.chunkKey(id)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	stored, err := io.ReadAll(f)
+	stored, _, err := r.store.Get(key)
 	if err != nil {
 		return nil, err
 	}
@@ -518,7 +531,7 @@ func (r *Repository) BackupWithOptions(source string, cfg chunker.Config, option
 	if !info.IsDir() {
 		return manifest, stats, fmt.Errorf("source must be a directory")
 	}
-	if isWithin(r.Root, sourceAbs) {
+	if !r.remote && isWithin(r.Root, sourceAbs) {
 		return manifest, stats, fmt.Errorf("repository must not be inside the source directory")
 	}
 
@@ -749,12 +762,8 @@ func (r *Repository) publishManifest(m model.Manifest) error {
 	if err := validateManifest(m); err != nil {
 		return err
 	}
-	tmp := filepath.Join(r.tmpDir(), "snapshot-"+m.SnapshotID)
-	if err := os.Mkdir(tmp, 0755); err != nil {
-		return fmt.Errorf("create snapshot staging area: %w", err)
-	}
-	defer os.RemoveAll(tmp)
-	if err := r.writeManifest(filepath.Join(tmp, r.manifestName()), m); err != nil {
+	b, err := r.manifestBytes(m)
+	if err != nil {
 		return err
 	}
 	if r.beforeSnapshotPublish != nil {
@@ -762,7 +771,10 @@ func (r *Repository) publishManifest(m model.Manifest) error {
 			return err
 		}
 	}
-	if err := os.Rename(tmp, filepath.Join(r.snapshotsDir(), m.SnapshotID)); err != nil {
+	if _, err := r.store.PutIfAbsent(r.manifestKey(m.SnapshotID), b); err != nil {
+		if errors.Is(err, errObjectExists) {
+			return fmt.Errorf("publish snapshot: snapshot %s already exists", m.SnapshotID)
+		}
 		return fmt.Errorf("publish snapshot: %w", err)
 	}
 	return nil
@@ -776,7 +788,7 @@ func (r *Repository) ReadManifest(id string) (model.Manifest, error) {
 	if strings.ContainsAny(id, `\\/`) || id == "" {
 		return m, fmt.Errorf("invalid snapshot ID")
 	}
-	b, err := os.ReadFile(filepath.Join(r.snapshotsDir(), id, r.manifestName()))
+	b, _, err := r.store.Get(r.manifestKey(id))
 	if err != nil {
 		return m, fmt.Errorf("read snapshot %s: %w", id, err)
 	}
@@ -799,16 +811,17 @@ func (r *Repository) ReadManifest(id string) (model.Manifest, error) {
 }
 
 func (r *Repository) Snapshots() ([]model.Manifest, error) {
-	entries, err := os.ReadDir(r.snapshotsDir())
+	entries, err := r.store.List("snapshots/")
 	if err != nil {
 		return nil, err
 	}
 	var snapshots []model.Manifest
 	for _, entry := range entries {
-		if !entry.IsDir() {
+		parts := strings.Split(entry.Key, "/")
+		if len(parts) != 3 || parts[0] != "snapshots" || parts[2] != r.manifestName() {
 			continue
 		}
-		m, err := r.ReadManifest(entry.Name())
+		m, err := r.ReadManifest(parts[1])
 		if err != nil {
 			return nil, err
 		}
@@ -1107,7 +1120,7 @@ func (r *Repository) validateCleanDestination(destination, source string) error 
 	}
 	// Cleaning a repository, a parent of one, or the original source risks
 	// destroying the only backup copy or the source being restored.
-	if pathsOverlap(destination, r.Root) {
+	if !r.remote && pathsOverlap(destination, r.Root) {
 		return fmt.Errorf("refusing to clean destination overlapping repository: %s", destination)
 	}
 	if source != "" && pathsOverlap(destination, source) {
@@ -1140,37 +1153,8 @@ func applyMetadata(path string, entry model.FileEntry) error {
 }
 
 func (r *Repository) Verify(snapshotID string) error {
-	var manifests []model.Manifest
-	if snapshotID != "" {
-		m, err := r.ReadManifest(snapshotID)
-		if err != nil {
-			return err
-		}
-		manifests = []model.Manifest{m}
-	} else {
-		var err error
-		manifests, err = r.Snapshots()
-		if err != nil {
-			return err
-		}
-	}
-	// Chunks are content-addressed and may appear in many files and snapshots.
-	// Verify each physical object once per invocation.
-	verified := make(map[string]struct{})
-	for _, m := range manifests {
-		for _, entry := range m.Files {
-			for _, ref := range entry.Chunks {
-				if _, ok := verified[ref.ID]; ok {
-					continue
-				}
-				if err := r.verifyChunk(ref.ID); err != nil {
-					return fmt.Errorf("snapshot %s, file %s: %w", m.SnapshotID, entry.Path, err)
-				}
-				verified[ref.ID] = struct{}{}
-			}
-		}
-	}
-	return nil
+	_, err := r.VerifyWithOptions(snapshotID, VerifyOptions{})
+	return err
 }
 
 // Stats reports physical chunk bytes and logical bytes across all snapshots.
@@ -1189,21 +1173,15 @@ func (r *Repository) Stats() (chunks int, physicalBytes int64, snapshots int, lo
 			}
 		}
 	}
-	err = filepath.WalkDir(r.chunksDir(), func(path string, e fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if !e.IsDir() {
-			i, err := e.Info()
-			if err != nil {
-				return err
-			}
-			chunks++
-			physicalBytes += i.Size()
-		}
-		return nil
-	})
-	return
+	objects, err := r.store.List("chunks/")
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	for _, object := range objects {
+		chunks++
+		physicalBytes += object.Size
+	}
+	return chunks, physicalBytes, snapshots, logicalBytes, nil
 }
 
 func validateManifest(m model.Manifest) error {
@@ -1303,27 +1281,40 @@ func (r *Repository) manifestName() string {
 	return "manifest.json"
 }
 
+func (r *Repository) manifestKey(id string) string { return "snapshots/" + id + "/" + r.manifestName() }
+
+func (r *Repository) manifestBytes(manifest model.Manifest) ([]byte, error) {
+	b, err := marshalJSON(manifest)
+	if err != nil {
+		return nil, err
+	}
+	if r.key != nil {
+		return r.encrypt(b, []byte("vestige/manifest/"+manifest.SnapshotID))
+	}
+	return b, nil
+}
+
 func (r *Repository) writeManifest(path string, manifest model.Manifest) error {
-	b, err := json.MarshalIndent(manifest, "", "  ")
+	b, err := r.manifestBytes(manifest)
 	if err != nil {
 		return err
-	}
-	b = append(b, '\n')
-	if r.key != nil {
-		b, err = r.encrypt(b, []byte("vestige/manifest/"+manifest.SnapshotID))
-		if err != nil {
-			return err
-		}
 	}
 	return writeAtomic(path, b)
 }
 
-func writeJSONAtomic(path string, value any) error {
+func marshalJSON(value any) ([]byte, error) {
 	b, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
+}
+
+func writeJSONAtomic(path string, value any) error {
+	b, err := marshalJSON(value)
 	if err != nil {
 		return err
 	}
-	b = append(b, '\n')
 	return writeAtomic(path, b)
 }
 

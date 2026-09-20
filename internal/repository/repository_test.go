@@ -678,6 +678,166 @@ func TestGarbageCollectDryRunAndSweep(t *testing.T) {
 	}
 }
 
+func TestDeleteGCAndRestoreKeepsSharedChunks(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	shared := []byte("this chunk is deliberately shared between snapshots")
+	if err := os.WriteFile(filepath.Join(source, "shared.txt"), shared, 0644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Open(filepath.Join(root, "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := r.Backup(source, smallConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "new.txt"), []byte("only in second snapshot"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := r.Backup(source, smallConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.DeleteSnapshot(first.SnapshotID, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := r.GarbageCollect(true, 0)
+	if err != nil || preview.OrphanChunks != 0 {
+		t.Fatalf("shared snapshot dry-run = %+v, %v", preview, err)
+	}
+	if _, err := r.GarbageCollect(false, 0); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(root, "restored")
+	if err := r.Restore(second.SnapshotID, destination); err != nil {
+		t.Fatalf("restore surviving snapshot after delete and GC: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(destination, "shared.txt"))
+	if err != nil || !bytes.Equal(got, shared) {
+		t.Fatalf("restored shared content = %q, %v", got, err)
+	}
+}
+
+func TestCheckReportsMissingAndOrphanChunks(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "file.txt"), []byte("check me"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Open(filepath.Join(root, "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _, err := r.Backup(source, smallConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunkPath, err := r.chunkPath(snapshot.Files[0].Chunks[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(chunkPath); err != nil {
+		t.Fatal(err)
+	}
+	orphanID := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	orphanPath, err := r.chunkPath(orphanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(orphanPath), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(orphanPath, []byte("orphan"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := r.Check()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Healthy() || report.OrphanChunks != 1 || len(report.Issues) != 2 {
+		t.Fatalf("unexpected check report: %+v", report)
+	}
+	kinds := map[string]bool{}
+	for _, issue := range report.Issues {
+		kinds[issue.Kind] = true
+	}
+	if !kinds["missing_chunk"] || !kinds["orphan_chunk"] {
+		t.Fatalf("unexpected issues: %+v", report.Issues)
+	}
+}
+
+func TestVerifyResumesFromCheckpoint(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	if err := os.Mkdir(source, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "first.txt"), bytes.Repeat([]byte("a"), 128), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "second.txt"), bytes.Repeat([]byte("b"), 128), 0644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := Open(filepath.Join(root, "repo"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, _, err := r.Backup(source, smallConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]bool{}
+	for _, entry := range snapshot.Files {
+		for _, ref := range entry.Chunks {
+			ids[ref.ID] = true
+		}
+	}
+	if len(ids) < 2 {
+		t.Fatal("test fixture did not produce multiple chunks")
+	}
+	var first string
+	for id := range ids {
+		first = id
+		break
+	}
+	statePath := filepath.Join(root, "verify-state.json")
+	if err := writeJSONAtomic(statePath, verifyState{Repository: r.Root, Selector: snapshot.SnapshotID, Verified: map[string]bool{first: true}}); err != nil {
+		t.Fatal(err)
+	}
+	report, err := r.VerifyWithOptions(snapshot.SnapshotID, VerifyOptions{StatePath: statePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.ResumedChunks != 1 || report.VerifiedChunks != len(ids)-1 {
+		t.Fatalf("unexpected verification report: %+v", report)
+	}
+	if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+		t.Fatal("successful verification left a checkpoint behind")
+	}
+}
+
+func TestOpenRejectsCorruptRepositoryConfig(t *testing.T) {
+	root := t.TempDir()
+	repoPath := filepath.Join(root, "repo")
+	if _, err := Open(repoPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoPath, "config.json"), []byte("not json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(repoPath); err == nil {
+		t.Fatal("opened repository with corrupt config")
+	}
+}
+
 func TestBackupLockAndExplicitStaleRecovery(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source")
