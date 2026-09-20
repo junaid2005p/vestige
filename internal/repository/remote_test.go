@@ -60,6 +60,19 @@ func (s *memoryStore) PutIfAbsent(key string, data []byte) (string, error) {
 	return localVersion(data), nil
 }
 
+func (s *memoryStore) ReplaceIfVersion(key string, data []byte, version string) (string, error) {
+	old, actual, err := s.Get(key)
+	_ = old
+	if err != nil {
+		return "", err
+	}
+	if actual != version {
+		return "", errObjectChanged
+	}
+	s.objects[key] = append([]byte(nil), data...)
+	return localVersion(data), nil
+}
+
 func (s *memoryStore) DeleteIfVersion(key, version string) error {
 	b, actual, err := s.Get(key)
 	_ = b

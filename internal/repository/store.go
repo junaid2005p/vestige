@@ -31,6 +31,7 @@ var (
 type objectStore interface {
 	Get(key string) (data []byte, version string, err error)
 	PutIfAbsent(key string, data []byte) (version string, err error)
+	ReplaceIfVersion(key string, data []byte, version string) (newVersion string, err error)
 	DeleteIfVersion(key, version string) error
 	Delete(key string) error
 	List(prefix string) ([]storedObject, error)
@@ -128,6 +129,24 @@ func (s localStore) DeleteIfVersion(key, version string) error {
 	} else {
 		return err
 	}
+}
+
+func (s localStore) ReplaceIfVersion(key string, data []byte, version string) (string, error) {
+	_, actual, err := s.Get(key)
+	if err != nil {
+		return "", err
+	}
+	if actual != version {
+		return "", errObjectChanged
+	}
+	path, err := s.path(key)
+	if err != nil {
+		return "", err
+	}
+	if err := writeAtomic(path, data); err != nil {
+		return "", err
+	}
+	return localVersion(data), nil
 }
 
 func (s localStore) Delete(key string) error {
@@ -256,6 +275,18 @@ func (s *s3Store) PutIfAbsent(key string, data []byte) (string, error) {
 	out, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(s.fullKey(key)), Body: bytes.NewReader(data), IfNoneMatch: aws.String("*")})
 	if err != nil {
 		return "", s3KeyError(err)
+	}
+	return aws.ToString(out.ETag), nil
+}
+
+func (s *s3Store) ReplaceIfVersion(key string, data []byte, version string) (string, error) {
+	out, err := s.client.PutObject(context.Background(), &s3.PutObjectInput{Bucket: aws.String(s.bucket), Key: aws.String(s.fullKey(key)), Body: bytes.NewReader(data), IfMatch: aws.String(version)})
+	if err != nil {
+		if mapped := s3KeyError(err); errors.Is(mapped, errObjectExists) {
+			return "", errObjectChanged
+		} else {
+			return "", mapped
+		}
 	}
 	return aws.ToString(out.ETag), nil
 }

@@ -16,6 +16,9 @@ type EncryptionConfig struct {
 	KDF        string `json:"kdf"`
 	Iterations int    `json:"iterations"`
 	Salt       string `json:"salt"`
+	// WrappedKey is the repository data key encrypted by the passphrase-derived
+	// key. Empty identifies encrypted repositories created before key rotation.
+	WrappedKey string `json:"wrapped_key,omitempty"`
 	KeyCheck   string `json:"key_check"`
 }
 
